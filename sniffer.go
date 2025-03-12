@@ -27,14 +27,10 @@ type Packet struct {
 	Raw        []byte      `json:"raw"`
 }
 
-type UniCmdItem struct {
-	PacketId   uint16      `json:"packetId"`
-	PacketName string      `json:"packetName"`
-	Object     interface{} `json:"object"`
-	Raw        []byte      `json:"raw"`
-}
+var playerGetTokenCsReqId uint16
+var playerGetTokenScRspId uint16
 
-var getPlayerTokenRspPacketId uint16
+var clientSecretKey uint64
 
 var initialKey = make(map[uint32][]byte)
 var sessionKey []byte
@@ -102,7 +98,8 @@ func readKeys() {
 		initialKey[k] = decode
 	}
 
-	getPlayerTokenRspPacketId = packetNameMap["GetPlayerTokenRsp"]
+	playerGetTokenCsReqId = packetNameMap["PlayerGetTokenCsReq"]
+	playerGetTokenScRspId = packetNameMap["PlayerGetTokenScRsp"]
 }
 
 func startSniffer() {
@@ -150,7 +147,9 @@ func startSniffer() {
 }
 
 func handleKcp(data []byte, fromServer bool, capTime time.Time) {
+	//log.Println("Data in KCP:", base64.RawStdEncoding.EncodeToString(data))
 	data = reformData(data)
+	//log.Println("Data after reformat:", base64.RawStdEncoding.EncodeToString(data))
 	conv := binary.LittleEndian.Uint32(data[:4])
 	key := strconv.Itoa(int(conv))
 	if fromServer {
@@ -194,6 +193,7 @@ func handleSpecialPacket(data []byte, fromServer bool, timestamp time.Time) {
 
 func handleProtoPacket(data []byte, fromServer bool, timestamp time.Time) {
 	key := binary.BigEndian.Uint32(data[:8])
+	//log.Println("Data before xor:", base64.RawStdEncoding.EncodeToString(data))
 	key = key ^ 0x01234567
 	var xorPad []byte
 
@@ -206,40 +206,77 @@ func handleProtoPacket(data []byte, fromServer bool, timestamp time.Time) {
 		}
 		xorPad = initialKey[key]
 	}
-	xorDecrypt(data, xorPad)
 
 	packetId := binary.BigEndian.Uint16(data[4:6])
 	var objectJson interface{}
 
-	if packetId == getPlayerTokenRspPacketId {
-		data, objectJson = handleGetPlayerTokenRspPacket(data, packetId, objectJson)
+	if packetId == playerGetTokenScRspId {
+		data = removeMagic(data)
+		xorDecrypt(data, xorPad)
+		//log.Println("Data after xor:", base64.RawStdEncoding.EncodeToString(data))
+		data, objectJson = PlayerGetTokenScRspPacket(data, packetId, objectJson)
+		//} else if packetId == playerGetTokenCsReqId {
+		//	data = removeMagic(data)
+		//	xorDecrypt(data, xorPad)
+		//	data, objectJson = PlayerGetTokenCsReqPacket(data, packetId, objectJson)
 	} else {
 		data = removeHeaderForParse(data)
+		xorDecrypt(data, xorPad)
+		//log.Println("Data after xor:", base64.RawStdEncoding.EncodeToString(data))
 		objectJson = parseProtoToInterface(packetId, data)
 	}
 
 	buildPacketToSend(data, fromServer, timestamp, packetId, objectJson)
 }
 
-func handleGetPlayerTokenRspPacket(data []byte, packetId uint16, objectJson interface{}) ([]byte, interface{}) {
-	data = removeMagic(data)
+func PlayerGetTokenCsReqPacket(data []byte, packetId uint16, objectJson interface{}) ([]byte, interface{}) {
 	dMsg, err := parseProto(packetId, data)
 	if err != nil {
-		log.Println("Could not parse GetPlayerTokenRspPacket proto", err)
+		log.Println("Could not parse PlayerGetTokenCsReq proto", err)
 		closeHandle()
 	}
 	oj, err := dMsg.MarshalJSON()
 	if err != nil {
-		log.Println("Could not parse GetPlayerTokenRspPacket proto", err)
+		log.Println("Could not parse PlayerGetTokenCsReq proto", err)
 		closeHandle()
 	}
 	err = json.Unmarshal(oj, &objectJson)
 	if err != nil {
-		log.Println("Could not parse GetPlayerTokenRspPacket proto", err)
+		log.Println("Could not parse PlayerGetTokenCsReq proto", err)
 		closeHandle()
 	}
-	seed := dMsg.GetFieldByName("secret_key_seed").(uint64)
-	sessionKey = createXorPad(seed)
+	seedStr := dMsg.GetFieldByName("client_rand_key").(string)
+	seed, _ := base64.StdEncoding.DecodeString(seedStr)
+	decrSeed, _ := decrypt("data/server_private_3.pem", seed) // Waiting for leak? Try XOR known plaintext attack?
+	clientSecretKey = binary.LittleEndian.Uint64(decrSeed)
+	return data, objectJson
+}
+
+func PlayerGetTokenScRspPacket(data []byte, packetId uint16, objectJson interface{}) ([]byte, interface{}) {
+	dMsg, err := parseProto(packetId, data)
+	if err != nil {
+		log.Println("Could not parse PlayerGetTokenScRsp proto", err)
+		closeHandle()
+	}
+	oj, err := dMsg.MarshalJSON()
+	if err != nil {
+		log.Println("Could not parse PlayerGetTokenScRsp proto", err)
+		closeHandle()
+	}
+	err = json.Unmarshal(oj, &objectJson)
+	if err != nil {
+		log.Println("Could not parse PlayerGetTokenScRsp proto", err)
+		closeHandle()
+	}
+	seedStr := dMsg.GetFieldByName("server_rand_key").(string)
+	seed, err := base64.StdEncoding.DecodeString(seedStr)
+	if err != nil {
+		log.Println("Could not parse PlayerGetTokenScRsp proto", err)
+		closeHandle()
+	}
+	decrBytes, _ := decrypt("data/private_3.pem", seed)
+	decrSeed := binary.LittleEndian.Uint64(decrBytes)
+	sessionKey = createXorPad(decrSeed ^ clientSecretKey)
 
 	return data, objectJson
 }
@@ -260,7 +297,7 @@ func buildPacketToSend(data []byte, fromSever bool, timestamp time.Time, packetI
 	}
 	logPacket(packet)
 
-	if packetFilter[GetProtoNameById(packetId)] {
+	if GetProtoNameById(packetId) != "" && packetFilter[GetProtoNameById(packetId)] {
 		return
 	}
 	sendStreamMsg(string(jsonResult))

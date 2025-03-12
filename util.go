@@ -2,7 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
+	"fmt"
+	"log"
+	"os"
 )
 
 func removeMagic(data []byte) []byte {
@@ -50,15 +57,52 @@ func reformData(data []byte) []byte {
 func createXorPad(seed uint64) []byte {
 	first := New()
 	first.Seed(int64(seed))
-	//generator := New()
-	//generator.Seed(first.Generate())
-	//generator.Generate()
 	xorPad := make([]byte, 4096)
 
 	for i := 0; i < 4096; i += 8 {
-		//value := generator.Generate()
 		value := first.Generate()
 		binary.BigEndian.PutUint64(xorPad[i:i+8], uint64(value))
 	}
 	return xorPad
+}
+
+func decrypt(keypath string, ciphertext []byte) ([]byte, error) {
+	rest, _ := os.ReadFile(keypath)
+	// var ok bool
+	var block *pem.Block
+	var priv *rsa.PrivateKey
+	for {
+		block, rest = pem.Decode(rest)
+		if block.Type == "RSA PRIVATE KEY" {
+			k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+			if err != nil {
+				log.Println(err)
+			} //else if priv, ok = k.(*rsa.PrivateKey); !ok {
+			//	log.Println(fmt.Errorf("failed to parse private key"))
+			//}
+			priv = k
+			break
+		}
+		if len(rest) == 0 {
+			if priv == nil {
+				log.Println(fmt.Errorf("failed to parse private key"))
+			}
+			break
+		}
+	}
+	out := make([]byte, 0, 1024)
+	for len(ciphertext) > 0 {
+		chunkSize := 128
+		if chunkSize > len(ciphertext) {
+			chunkSize = len(ciphertext)
+		}
+		chunk := ciphertext[:chunkSize]
+		ciphertext = ciphertext[chunkSize:]
+		b, err := rsa.DecryptPKCS1v15(rand.Reader, priv, chunk)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b...)
+	}
+	return out, nil
 }
