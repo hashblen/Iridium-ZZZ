@@ -1,4 +1,4 @@
-module github.com/Akka0/Iridium-NG
+module github.com/Hashblen/Iridium-ZZZ
 
 go 1.18
 
