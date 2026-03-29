@@ -4,12 +4,9 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/x509"
 	"encoding/binary"
-	"encoding/pem"
-	"fmt"
 	"log"
-	"os"
+	"math/big"
 )
 
 func removeMagic(data []byte) []byte {
@@ -20,10 +17,31 @@ func removeMagic(data []byte) []byte {
 	return data
 }
 
+func getHeaderAndBody(data []byte) ([]byte, []byte) {
+	cut := data[7]
+	data = data[10+2:]           // Removes token + two byte magic
+	data = data[0 : len(data)-4] // Removes two byte magic at the end
+	if len(data) < int(cut) {
+		return data, nil
+	}
+	header := data[:cut]
+	data = data[cut:]
+	return header, data
+}
+
 func removeHeaderForParse(data []byte) []byte {
-	cut := data[8]
-	data = removeMagic(data)
-	return data[cut:]
+	//cut := data[8]
+	//data = removeMagic(data)
+	//return data[cut:]
+	if binary.BigEndian.Uint32(data[0:4]) != 0x01234567 || binary.BigEndian.Uint32(data[len(data)-4:]) != 0x89ABCDEF {
+		log.Println("ERROR MAGIC IS WRONG")
+		return nil
+	}
+	data = data[4+2 : len(data)-4] // Magic + cmdid
+	head_len := binary.BigEndian.Uint16(data[0:2])
+	body_len := binary.BigEndian.Uint32(data[2:6])
+	data = data[6:]
+	return data[head_len : uint32(head_len)+body_len]
 }
 
 func xorDecrypt(data []byte, key []byte) {
@@ -54,55 +72,73 @@ func reformData(data []byte) []byte {
 	return bytes.Join(messages, []byte{})
 }
 
-func createXorPad(seed uint64) []byte {
-	first := New()
-	first.Seed(int64(seed))
-	xorPad := make([]byte, 4096)
+func newKey(seed uint64) []byte {
+	generator := MT19937_64_new()
+	generator.Seed(seed)
 
+	// Generate the key.
+	btes := make([]byte, 0, 4096)
 	for i := 0; i < 4096; i += 8 {
-		value := first.Generate()
-		binary.BigEndian.PutUint64(xorPad[i:i+8], uint64(value))
+		btes = binary.BigEndian.AppendUint64(btes, generator.NextULong())
 	}
-	return xorPad
+
+	return btes
 }
 
-func decrypt(keypath string, ciphertext []byte) ([]byte, error) {
-	rest, _ := os.ReadFile(keypath)
-	// var ok bool
-	var block *pem.Block
-	var priv *rsa.PrivateKey
-	for {
-		block, rest = pem.Decode(rest)
-		if block.Type == "RSA PRIVATE KEY" {
-			k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-			if err != nil {
-				log.Println(err)
-			} //else if priv, ok = k.(*rsa.PrivateKey); !ok {
-			//	log.Println(fmt.Errorf("failed to parse private key"))
-			//}
-			priv = k
-			break
-		}
-		if len(rest) == 0 {
-			if priv == nil {
-				log.Println(fmt.Errorf("failed to parse private key"))
-			}
-			break
-		}
-	}
-	out := make([]byte, 0, 1024)
-	for len(ciphertext) > 0 {
-		chunkSize := 128
-		if chunkSize > len(ciphertext) {
-			chunkSize = len(ciphertext)
-		}
-		chunk := ciphertext[:chunkSize]
-		ciphertext = ciphertext[chunkSize:]
-		b, err := rsa.DecryptPKCS1v15(rand.Reader, priv, chunk)
+func guess(filetime uint64, serverSeed uint64, depth int, data []byte, packetId uint16) (uint64, []byte) {
+	//filetime = 0x1dcbf98a0159de2
+	mixed := new(big.Int).SetUint64(0x701ce1722770000 + filetime)
+	mask := new(big.Int).SetUint64(0x3fffffffffffffff)
+	mixed.And(mixed, mask)
+	M := new(big.Int).SetUint64(0x1AD7F29ABCAF48)
+	product := new(big.Int).Mul(mixed, M)
+	product.Rsh(product, 76)
+	computed_seed := int32(product.Uint64())
+	generator := NewRandom(computed_seed)
+	for i := 0; i < depth; i++ {
+		clientSeedHigh := generator.NextInt()
+		clientSeed := uint64(uint32(computed_seed)) | (uint64(clientSeedHigh) << 32)
+
+		aSeed := clientSeed ^ serverSeed
+		key := newKey(aSeed)
+
+		clone := make([]byte, len(data))
+		copy(clone, data)
+		xorDecrypt(clone, key)
+		_, err := parseProto(packetId, clone)
 		if err != nil {
-			return nil, err
+			continue
 		}
-		out = append(out, b...)
+		log.Println("Found encryption key seed:", aSeed, "at depth", i)
+		return aSeed, key
 	}
-	return out, nil
+	return 0, nil
+}
+
+func bruteforce(ms uint64, serverSeed uint64, data []byte, packetId uint16) (uint64, []byte) {
+	filetime := int64(ms*10_000 + 116444736000000000)
+	for i := int64(0); i < 30000; i++ {
+		offset := func() int64 {
+			if i%2 == 0 {
+				return i / 2
+			}
+			return -(i - 1) / 2
+		}()
+		time := uint64(filetime + offset)
+		seed, key := guess(time, serverSeed, 1, data, packetId)
+		if key != nil {
+			log.Println("Found for time", time)
+			return seed, key
+		}
+	}
+	log.Println("Unable to find the encryption key seed.")
+	return 0, nil
+}
+
+func decrypt(priv *rsa.PrivateKey, ciphertext []byte) ([]byte, error) {
+	b, err := rsa.DecryptPKCS1v15(rand.Reader, priv, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }

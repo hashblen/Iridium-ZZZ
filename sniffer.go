@@ -1,21 +1,26 @@
 package main
 
 import (
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/fatih/color"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/xtaci/kcp-go"
-	"io/ioutil"
-	"log"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 )
 
 type Packet struct {
@@ -30,10 +35,13 @@ type Packet struct {
 var playerGetTokenCsReqId uint16
 var playerGetTokenScRspId uint16
 
-var clientSecretKey uint64
+var serverSeed uint64
+var sentMs uint64
 
-var initialKey = make(map[uint32][]byte)
+var initialKey []byte
 var sessionKey []byte
+
+var privateKey *rsa.PrivateKey
 
 var captureHandler *pcap.Handle
 var kcpMap map[string]*kcp.KCP
@@ -83,23 +91,61 @@ func closeHandle() {
 }
 
 func readKeys() {
-	var initialKeyJson map[uint32]string
-	file, err := ioutil.ReadFile("./data/Keys.json")
+	file, err := os.ReadFile("./data/Key.txt")
 	if err != nil {
-		log.Fatal("Could not load initial key @ ./data/Keys.json #1", err)
+		log.Fatal("Could not load initial key @ ./data/Key.txt #1", err)
 	}
-	err = json.Unmarshal(file, &initialKeyJson)
-	if err != nil {
-		log.Fatal("Could not load initial key @ ./data/Keys.json #2", err)
-	}
+	initialKeyString := strings.TrimSpace(string(file))
 
-	for k, v := range initialKeyJson {
-		decode, _ := base64.RawStdEncoding.DecodeString(v)
-		initialKey[k] = decode
-	}
+	decode, _ := base64.RawStdEncoding.DecodeString(initialKeyString)
+	initialKey = decode
 
 	playerGetTokenCsReqId = packetNameMap["PlayerGetTokenCsReq"]
 	playerGetTokenScRspId = packetNameMap["PlayerGetTokenScRsp"]
+
+	privateKeyFile, err := os.ReadFile("data/private_3.pem")
+	if err != nil {
+		log.Fatal("Could not read private key @ ./data/private_3.pem #3", err)
+	}
+	var priv *rsa.PrivateKey
+	for {
+		block, rest := pem.Decode(privateKeyFile)
+		if block.Type == "RSA PRIVATE KEY" {
+			k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+			if err != nil {
+				log.Println(err)
+			}
+			priv = k
+			break
+		}
+		if len(rest) == 0 {
+			log.Println(fmt.Errorf("failed to parse private key"))
+			break
+		}
+	}
+	privateKey = priv
+
+	/*publicKeyFile, err := os.ReadFile("data/public_3.pem")
+	if err != nil {
+		log.Fatal("Could not read public key @ ./data/private_3.pem #3", err)
+	}
+	var pub *rsa.PublicKey
+	for {
+		block, rest := pem.Decode(publicKeyFile)
+		if block.Type == "PUBLIC KEY" {
+			k, err := x509.ParsePKCS1PublicKey(block.Bytes)
+			if err != nil {
+				log.Println(err)
+			}
+			pub = k
+			break
+		}
+		if len(rest) == 0 {
+			log.Println(fmt.Errorf("failed to parse private key"))
+			break
+		}
+	}
+	publicKey = pub*/
 }
 
 func startSniffer() {
@@ -192,35 +238,56 @@ func handleSpecialPacket(data []byte, fromServer bool, timestamp time.Time) {
 }
 
 func handleProtoPacket(data []byte, fromServer bool, timestamp time.Time) {
-	key := binary.BigEndian.Uint32(data[:8])
+	key := binary.BigEndian.Uint32(data[:4])
+	if key != 0x01234567 {
+		log.Fatal("Head magic is wrong")
+	}
 	//log.Println("Data before xor:", base64.RawStdEncoding.EncodeToString(data))
-	key = key ^ 0x01234567
 	var xorPad []byte
 
 	if sessionKey != nil {
 		xorPad = sessionKey
 	} else {
-		if len(initialKey[key]) == 0 {
-			log.Println("Could not found initial key to decrypt", key)
-			closeHandle()
-		}
-		xorPad = initialKey[key]
+		xorPad = initialKey
 	}
 
 	packetId := binary.BigEndian.Uint16(data[4:6])
 	var objectJson interface{}
 
 	if packetId == playerGetTokenScRspId {
-		data = removeMagic(data)
+		header, body := getHeaderAndBody(data)
+		data = body
+		log.Println("Header:", base64.StdEncoding.EncodeToString(header))
 		xorDecrypt(data, xorPad)
 		//log.Println("Data after xor:", base64.RawStdEncoding.EncodeToString(data))
 		data, objectJson = PlayerGetTokenScRspPacket(data, packetId, objectJson)
-		//} else if packetId == playerGetTokenCsReqId {
-		//	data = removeMagic(data)
-		//	xorDecrypt(data, xorPad)
-		//	data, objectJson = PlayerGetTokenCsReqPacket(data, packetId, objectJson)
+	} else if packetId == playerGetTokenCsReqId {
+		header, body := getHeaderAndBody(data)
+		data = body
+		log.Println("Header:", base64.StdEncoding.EncodeToString(header))
+		xorDecrypt(data, xorPad)
+		data, objectJson = PlayerGetTokenCsReqPacket(data, packetId, timestamp, objectJson)
 	} else {
-		data = removeHeaderForParse(data)
+		header, body := getHeaderAndBody(data)
+		data = body
+		log.Println("Header:", base64.StdEncoding.EncodeToString(header))
+		clone := make([]byte, len(data))
+		copy(clone, data)
+		xorDecrypt(clone, xorPad)
+		_, err := parseProto(packetId, clone)
+		if errors.Is(err, ErrProtoNotFound) {
+			log.Println("Unknown proto packet", packetId)
+			return
+		} else if err != nil {
+			log.Println("Cracking seed...", sentMs)
+			seed := sentMs
+			seed, xorPad = bruteforce(seed, serverSeed, data, packetId)
+			if seed == 0 || xorPad == nil {
+				log.Println("Could not bruteforce, skipping...")
+			} else {
+				sessionKey = xorPad
+			}
+		}
 		xorDecrypt(data, xorPad)
 		//log.Println("Data after xor:", base64.RawStdEncoding.EncodeToString(data))
 		objectJson = parseProtoToInterface(packetId, data)
@@ -229,7 +296,7 @@ func handleProtoPacket(data []byte, fromServer bool, timestamp time.Time) {
 	buildPacketToSend(data, fromServer, timestamp, packetId, objectJson)
 }
 
-func PlayerGetTokenCsReqPacket(data []byte, packetId uint16, objectJson interface{}) ([]byte, interface{}) {
+func PlayerGetTokenCsReqPacket(data []byte, packetId uint16, timestamp time.Time, objectJson interface{}) ([]byte, interface{}) {
 	dMsg, err := parseProto(packetId, data)
 	if err != nil {
 		log.Println("Could not parse PlayerGetTokenCsReq proto", err)
@@ -245,10 +312,7 @@ func PlayerGetTokenCsReqPacket(data []byte, packetId uint16, objectJson interfac
 		log.Println("Could not parse PlayerGetTokenCsReq proto", err)
 		closeHandle()
 	}
-	seedStr := dMsg.GetFieldByName("client_rand_key").(string)
-	seed, _ := base64.StdEncoding.DecodeString(seedStr)
-	decrSeed, _ := decrypt("data/server_private_3.pem", seed) // Waiting for leak? Try XOR known plaintext attack?
-	clientSecretKey = binary.LittleEndian.Uint64(decrSeed)
+	sentMs = uint64(timestamp.UnixMilli())
 	return data, objectJson
 }
 
@@ -274,9 +338,14 @@ func PlayerGetTokenScRspPacket(data []byte, packetId uint16, objectJson interfac
 		log.Println("Could not parse PlayerGetTokenScRsp proto", err)
 		closeHandle()
 	}
-	decrBytes, _ := decrypt("data/private_3.pem", seed)
+	decrBytes, err := decrypt(privateKey, seed)
+	if err != nil {
+		log.Println("Could not parse PlayerGetTokenScRsp proto", err)
+		closeHandle()
+	}
 	decrSeed := binary.LittleEndian.Uint64(decrBytes)
-	sessionKey = createXorPad(decrSeed ^ clientSecretKey)
+	serverSeed = decrSeed
+	log.Println("server seed:", serverSeed)
 
 	return data, objectJson
 }
