@@ -274,14 +274,18 @@ func handleProtoPacket(data []byte, fromServer bool, timestamp time.Time) {
 		clone := make([]byte, len(data))
 		copy(clone, data)
 		xorDecrypt(clone, xorPad)
+		usePcktId := packetId
 		_, err := parseProto(packetId, clone)
 		if errors.Is(err, ErrProtoNotFound) {
 			log.Println("Unknown proto packet", packetId)
-			return
-		} else if err != nil {
+			_, err = parseProto(0, clone) // Need "0": "Unk" in packet ids.
+			usePcktId = 0
+			// return
+		}
+		if err != nil {
 			log.Println("Cracking seed...", sentMs)
 			seed := sentMs
-			seed, xorPad = bruteforce(seed, serverSeed, data, packetId)
+			seed, xorPad = bruteforce(seed, serverSeed, data, usePcktId)
 			if seed == 0 || xorPad == nil {
 				log.Println("Could not bruteforce, skipping...")
 			} else {
